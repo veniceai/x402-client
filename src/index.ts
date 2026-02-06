@@ -1,14 +1,15 @@
 import { Wallet } from 'ethers'
 import { SiweMessage } from 'siwe'
 
+// =============================================================================
+// Types
+// =============================================================================
+
 export interface VeniceClientOptions {
-  /** API endpoint (default: https://api.venice.ai) */
   apiUrl?: string
-  /** Auto top-up settings */
   autoTopUp?: {
     enabled: boolean
     amount: number
-    threshold: number
   }
 }
 
@@ -39,54 +40,136 @@ export interface ChatResponse {
   }
 }
 
-export class VeniceClient {
+// =============================================================================
+// VeniceSigner - Core auth primitive
+// =============================================================================
+
+export class VeniceSigner {
   private wallet: Wallet
-  private apiUrl: string
-  private autoTopUp?: VeniceClientOptions['autoTopUp']
-  private _balance: number = 0
+  private domain: string
 
-  constructor(privateKey: string, options: VeniceClientOptions = {}) {
+  constructor(privateKey: string, apiUrl: string = 'https://api.venice.ai') {
     this.wallet = new Wallet(privateKey)
-    this.apiUrl = options.apiUrl || 'https://api.venice.ai'
-    this.autoTopUp = options.autoTopUp
+    this.domain = new URL(apiUrl).host
   }
 
-  /** Current credit balance in USD */
-  get balance(): number {
-    return this._balance
-  }
-
-  /** Wallet address */
   get address(): string {
     return this.wallet.address
   }
 
-  /**
-   * Chat completion (OpenAI-compatible)
-   */
-  async chat(params: ChatParams): Promise<ChatResponse> {
-    const authHeader = await this.createSignInHeader()
+  get privateKey(): string {
+    return this.wallet.privateKey
+  }
 
-    const response = await fetch(`${this.apiUrl}/api/v1/chat/completions`, {
+  /** Create X-Sign-In-With-X header */
+  async signIn(): Promise<string> {
+    const now = new Date()
+
+    const message = new SiweMessage({
+      domain: this.domain,
+      address: this.wallet.address,
+      statement: 'Sign in to Venice API',
+      uri: `https://${this.domain}`,
+      version: '1',
+      chainId: 8453,
+      nonce: Math.random().toString(36).substring(2, 15),
+      issuedAt: now.toISOString(),
+      expirationTime: new Date(now.getTime() + 10 * 60 * 1000).toISOString(),
+    })
+
+    const messageString = message.prepareMessage()
+    const signature = await this.wallet.signMessage(messageString)
+
+    return Buffer.from(JSON.stringify({
+      address: this.wallet.address,
+      message: messageString,
+      signature,
+      timestamp: now.getTime(),
+      chainId: 8453,
+    })).toString('base64')
+  }
+
+  /** Create X-402-Payment header */
+  async signPayment(requirements: {
+    asset: string
+    amount: string
+    payTo: string
+  }): Promise<string> {
+    const { createPaymentHeader, createSigner } = await import('x402/client')
+    const signer = await createSigner('base', this.wallet.privateKey as `0x${string}`)
+
+    return createPaymentHeader(signer, {
+      scheme: 'exact' as const,
+      network: 'base' as const,
+      asset: requirements.asset,
+      amount: requirements.amount,
+      payTo: requirements.payTo,
+      maxTimeoutSeconds: 300,
+      extra: { name: 'USD Coin', version: '2' },
+    })
+  }
+}
+
+// =============================================================================
+// createAuthFetch - For OpenAI-compatible tools
+// =============================================================================
+
+export function createAuthFetch(
+  privateKey: string,
+  options: { apiUrl?: string } = {}
+): typeof fetch {
+  const signer = new VeniceSigner(privateKey, options.apiUrl)
+
+  return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const headers = new Headers(init?.headers)
+    headers.set('X-Sign-In-With-X', await signer.signIn())
+
+    return fetch(input, { ...init, headers })
+  }
+}
+
+// =============================================================================
+// VeniceClient - High-level API
+// =============================================================================
+
+export class VeniceClient {
+  private apiUrl: string
+  private autoTopUp?: VeniceClientOptions['autoTopUp']
+  private _balance: number = 0
+
+  public readonly signer: VeniceSigner
+  public readonly fetch: typeof fetch
+
+  constructor(privateKey: string, options: VeniceClientOptions = {}) {
+    this.apiUrl = options.apiUrl || 'https://api.venice.ai'
+    this.autoTopUp = options.autoTopUp
+    this.signer = new VeniceSigner(privateKey, this.apiUrl)
+    this.fetch = createAuthFetch(privateKey, { apiUrl: this.apiUrl })
+  }
+
+  get balance(): number {
+    return this._balance
+  }
+
+  get address(): string {
+    return this.signer.address
+  }
+
+  /** Chat completion */
+  async chat(params: ChatParams): Promise<ChatResponse> {
+    const response = await this.fetch(`${this.apiUrl}/api/v1/chat/completions`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Sign-In-With-X': authHeader,
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(params),
     })
 
-    // Handle 402 - payment required
     if (response.status === 402) {
-      const data = await response.json()
-
-      // Auto top-up if enabled
       if (this.autoTopUp?.enabled) {
-        const amount = this.autoTopUp.amount || data.suggestedTopUpUsd || 10
-        await this.topUp(amount)
-        return this.chat(params) // Retry
+        await this.topUp(this.autoTopUp.amount || 10)
+        return this.chat(params)
       }
 
+      const data = await response.json()
       throw new VeniceError('INSUFFICIENT_BALANCE', 'Insufficient balance', {
         currentBalance: data.currentBalanceUsd,
         suggestedAmount: data.suggestedTopUpUsd,
@@ -95,25 +178,18 @@ export class VeniceClient {
 
     if (!response.ok) {
       const data = await response.json()
-      throw new VeniceError('API_ERROR', data.error || 'Request failed', {
-        status: response.status,
-      })
+      throw new VeniceError('API_ERROR', data.error || 'Request failed', { status: response.status })
     }
 
-    // Update balance from header
     const balanceHeader = response.headers.get('X-Balance-Remaining')
-    if (balanceHeader) {
-      this._balance = parseFloat(balanceHeader)
-    }
+    if (balanceHeader) this._balance = parseFloat(balanceHeader)
 
     return response.json()
   }
 
-  /**
-   * Top up balance with USDC
-   */
+  /** Top up balance with USDC */
   async topUp(amountUsd: number): Promise<void> {
-    // Step 1: Get payment requirements
+    // Get payment requirements
     const reqResponse = await fetch(`${this.apiUrl}/api/v1/x402/top-up`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -126,10 +202,13 @@ export class VeniceClient {
 
     const requirements = await reqResponse.json()
 
-    // Step 2: Create payment header using x402 protocol
-    const paymentHeader = await this.createPaymentHeader(requirements, amountUsd)
+    // Create and submit payment
+    const paymentHeader = await this.signer.signPayment({
+      asset: requirements.paymentInfo?.tokenAddress || '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
+      amount: String(Math.floor(amountUsd * 1e6)),
+      payTo: requirements.paymentInfo?.receiverWallet,
+    })
 
-    // Step 3: Submit payment
     const payResponse = await fetch(`${this.apiUrl}/api/v1/x402/top-up`, {
       method: 'POST',
       headers: {
@@ -147,72 +226,19 @@ export class VeniceClient {
     const result = await payResponse.json()
     this._balance = result.data?.newBalance || this._balance + amountUsd
   }
-
-  /**
-   * Create Sign-in-with-X header
-   */
-  private async createSignInHeader(): Promise<string> {
-    const now = new Date()
-    const expirationTime = new Date(now.getTime() + 10 * 60 * 1000) // 10 min
-
-    const message = new SiweMessage({
-      domain: new URL(this.apiUrl).host,
-      address: this.wallet.address,
-      statement: 'Sign in to Venice API',
-      uri: this.apiUrl,
-      version: '1',
-      chainId: 8453, // Base mainnet
-      nonce: Math.random().toString(36).substring(2, 15),
-      issuedAt: now.toISOString(),
-      expirationTime: expirationTime.toISOString(),
-    })
-
-    const messageString = message.prepareMessage()
-    const signature = await this.wallet.signMessage(messageString)
-
-    const payload = {
-      address: this.wallet.address,
-      message: messageString,
-      signature,
-      timestamp: now.getTime(),
-      chainId: 8453,
-    }
-
-    return Buffer.from(JSON.stringify(payload)).toString('base64')
-  }
-
-  /**
-   * Create x402 payment header
-   */
-  private async createPaymentHeader(requirements: any, amountUsd: number): Promise<string> {
-    // Dynamic import to avoid bundling x402 if not used
-    const { createPaymentHeader, createSigner } = await import('x402/client')
-
-    const signer = await createSigner('base', this.wallet.privateKey as `0x${string}`)
-
-    const paymentRequirements = {
-      scheme: 'exact' as const,
-      network: 'base' as const,
-      asset: requirements.paymentInfo?.tokenAddress || '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
-      amount: String(Math.floor(amountUsd * 1e6)), // USDC has 6 decimals
-      payTo: requirements.paymentInfo?.receiverWallet,
-      maxTimeoutSeconds: 300,
-      extra: { name: 'USD Coin', version: '2' },
-    }
-
-    return createPaymentHeader(signer, paymentRequirements)
-  }
 }
 
-export class VeniceError extends Error {
-  code: string
-  details?: Record<string, any>
+// =============================================================================
+// Error
+// =============================================================================
 
-  constructor(code: string, message: string, details?: Record<string, any>) {
+export class VeniceError extends Error {
+  constructor(
+    public code: string,
+    message: string,
+    public details?: Record<string, unknown>
+  ) {
     super(message)
-    this.code = code
-    this.details = details
     this.name = 'VeniceError'
   }
 }
-

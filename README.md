@@ -19,9 +19,15 @@ const response = await venice.chat({
   model: 'llama-3.3-70b',
   messages: [{ role: 'user', content: 'Hello!' }]
 })
+```
 
-console.log(response.choices[0].message.content)
-console.log(`Balance: $${venice.balance}`)
+## With OpenAI-Compatible Tools
+
+```typescript
+import { createAuthFetch } from '@venice-ai/x402-client'
+
+// Use with any tool that accepts a custom fetch
+const authFetch = createAuthFetch(process.env.WALLET_KEY)
 ```
 
 ## Payment
