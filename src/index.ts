@@ -13,6 +13,7 @@ export interface VeniceClientOptions {
   }
 }
 
+// Chat types
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant'
   content: string
@@ -40,6 +41,77 @@ export interface ChatResponse {
   }
 }
 
+// Models types
+export interface Model {
+  id: string
+  object: string
+  created: number
+  owned_by: string
+}
+
+export interface ModelsResponse {
+  object: string
+  data: Model[]
+}
+
+// Embeddings types
+export interface EmbeddingsParams {
+  model: string
+  input: string | string[]
+}
+
+export interface EmbeddingsResponse {
+  object: string
+  data: Array<{
+    object: string
+    embedding: number[]
+    index: number
+  }>
+  model: string
+  usage: {
+    prompt_tokens: number
+    total_tokens: number
+  }
+}
+
+// Image types
+export interface ImageGenerateParams {
+  model: string
+  prompt: string
+  width?: number
+  height?: number
+  n?: number
+  style_preset?: string
+}
+
+export interface ImageResponse {
+  created: number
+  data: Array<{
+    url?: string
+    b64_json?: string
+  }>
+}
+
+// Audio types
+export interface SpeechParams {
+  model: string
+  input: string
+  voice: string
+  response_format?: 'mp3' | 'wav' | 'opus' | 'flac'
+  speed?: number
+}
+
+export interface TranscribeParams {
+  model: string
+  file: Blob | Buffer
+  language?: string
+  response_format?: 'json' | 'text' | 'srt' | 'vtt'
+}
+
+export interface TranscribeResponse {
+  text: string
+}
+
 // =============================================================================
 // VeniceSigner - Core auth primitive
 // =============================================================================
@@ -61,7 +133,6 @@ export class VeniceSigner {
     return this.wallet.privateKey
   }
 
-  /** Create X-Sign-In-With-X header */
   async signIn(): Promise<string> {
     const now = new Date()
 
@@ -89,7 +160,6 @@ export class VeniceSigner {
     })).toString('base64')
   }
 
-  /** Create X-402-Payment header */
   async signPayment(requirements: {
     asset: string
     amount: string
@@ -145,11 +215,19 @@ export class VeniceClient {
   public readonly signer: VeniceSigner
   public readonly fetch: typeof fetch
 
+  // Sub-clients for namespaced APIs
+  public readonly images: ImagesAPI
+  public readonly audio: AudioAPI
+
   constructor(privateKey: string, options: VeniceClientOptions = {}) {
     this.apiUrl = options.apiUrl || 'https://api.venice.ai'
     this.autoTopUp = options.autoTopUp
     this.signer = new VeniceSigner(privateKey, this.apiUrl)
     this.fetch = createAuthFetch(privateKey, { apiUrl: this.apiUrl })
+
+    // Initialize sub-clients
+    this.images = new ImagesAPI(this)
+    this.audio = new AudioAPI(this)
   }
 
   get balance(): number {
@@ -160,18 +238,20 @@ export class VeniceClient {
     return this.signer.address
   }
 
-  /** Chat completion */
-  async chat(params: ChatParams): Promise<ChatResponse> {
-    const response = await this.fetch(`${this.apiUrl}/api/v1/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(params),
+  /** Internal request helper with 402 handling */
+  async request<T>(path: string, options: RequestInit = {}): Promise<T> {
+    const response = await this.fetch(`${this.apiUrl}${path}`, {
+      ...options,
+      headers: {
+        'Content-Type': 'application/json',
+        ...options.headers,
+      },
     })
 
     if (response.status === 402) {
       if (this.autoTopUp?.enabled) {
         await this.topUp(this.autoTopUp.amount || 10)
-        return this.chat(params)
+        return this.request(path, options)
       }
 
       const data = await response.json()
@@ -192,9 +272,29 @@ export class VeniceClient {
     return response.json()
   }
 
+  /** List available models */
+  async models(): Promise<ModelsResponse> {
+    return this.request('/api/v1/models')
+  }
+
+  /** Chat completion */
+  async chat(params: ChatParams): Promise<ChatResponse> {
+    return this.request('/api/v1/chat/completions', {
+      method: 'POST',
+      body: JSON.stringify(params),
+    })
+  }
+
+  /** Create embeddings */
+  async embeddings(params: EmbeddingsParams): Promise<EmbeddingsResponse> {
+    return this.request('/api/v1/embeddings', {
+      method: 'POST',
+      body: JSON.stringify(params),
+    })
+  }
+
   /** Top up balance with USDC */
   async topUp(amountUsd: number): Promise<void> {
-    // Get payment requirements
     const reqResponse = await fetch(`${this.apiUrl}/api/v1/x402/top-up`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -207,7 +307,6 @@ export class VeniceClient {
 
     const requirements = await reqResponse.json()
 
-    // Create and submit payment
     const paymentHeader = await this.signer.signPayment({
       asset: requirements.paymentInfo?.tokenAddress || '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
       amount: String(Math.floor(amountUsd * 1e6)),
@@ -230,6 +329,73 @@ export class VeniceClient {
 
     const result = await payResponse.json()
     this._balance = result.data?.newBalance || this._balance + amountUsd
+  }
+}
+
+// =============================================================================
+// ImagesAPI - Image generation
+// =============================================================================
+
+class ImagesAPI {
+  constructor(private client: VeniceClient) {}
+
+  /** Generate images from a prompt */
+  async generate(params: ImageGenerateParams): Promise<ImageResponse> {
+    return this.client.request('/api/v1/image/generate', {
+      method: 'POST',
+      body: JSON.stringify(params),
+    })
+  }
+}
+
+// =============================================================================
+// AudioAPI - Speech and transcription
+// =============================================================================
+
+class AudioAPI {
+  constructor(private client: VeniceClient) {}
+
+  /** Generate speech from text */
+  async speech(params: SpeechParams): Promise<Blob> {
+    const response = await this.client.fetch(
+      `${(this.client as any).apiUrl}/api/v1/audio/speech`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(params),
+      }
+    )
+
+    if (!response.ok) {
+      const data = await response.json()
+      throw new VeniceError('API_ERROR', data.error || 'Speech generation failed')
+    }
+
+    return response.blob()
+  }
+
+  /** Transcribe audio to text */
+  async transcribe(params: TranscribeParams): Promise<TranscribeResponse> {
+    const formData = new FormData()
+    formData.append('model', params.model)
+    formData.append('file', params.file as Blob)
+    if (params.language) formData.append('language', params.language)
+    if (params.response_format) formData.append('response_format', params.response_format)
+
+    const response = await this.client.fetch(
+      `${(this.client as any).apiUrl}/api/v1/audio/asr`,
+      {
+        method: 'POST',
+        body: formData,
+      }
+    )
+
+    if (!response.ok) {
+      const data = await response.json()
+      throw new VeniceError('API_ERROR', data.error || 'Transcription failed')
+    }
+
+    return response.json()
   }
 }
 
