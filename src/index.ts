@@ -95,17 +95,22 @@ export class VeniceSigner {
     amount: string
     payTo: string
   }): Promise<string> {
-    const { createPaymentHeader, createSigner } = await import('x402/client')
+    const { createPaymentHeader } = await import('x402/client')
+    const { createSigner } = await import('x402/types')
     const signer = await createSigner('base', this.wallet.privateKey as `0x${string}`)
 
-    return createPaymentHeader(signer, {
-      scheme: 'exact' as const,
-      network: 'base' as const,
+    return createPaymentHeader(signer, 1, {
+      scheme: 'exact',
+      network: 'base',
       asset: requirements.asset,
-      amount: requirements.amount,
+      maxAmountRequired: requirements.amount,
       payTo: requirements.payTo,
       maxTimeoutSeconds: 300,
       extra: { name: 'USD Coin', version: '2' },
+      resource: '',
+      description: 'Venice x402 payment',
+      mimeType: 'application/json',
+      outputSchema: undefined,
     })
   }
 }
