@@ -1,0 +1,50 @@
+{
+  "name": "@venice-ai/x402-client",
+  "version": "0.1.0",
+  "description": "AI inference with your crypto wallet. No API keys.",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup src/index.ts --format cjs,esm --dts",
+    "dev": "tsup src/index.ts --format cjs,esm --dts --watch",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "venice",
+    "ai",
+    "llm",
+    "x402",
+    "crypto",
+    "micropayments",
+    "ethereum",
+    "base",
+    "usdc",
+    "wallet"
+  ],
+  "author": "Venice AI",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/venice-ai/x402-client.git"
+  },
+  "homepage": "https://venice.ai",
+  "dependencies": {
+    "ethers": "^6.11.0",
+    "siwe": "^2.1.4",
+    "x402": "^1.1.0"
+  },
+  "devDependencies": {
+    "tsup": "^8.0.0",
+    "typescript": "^5.3.0",
+    "vitest": "^1.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
+

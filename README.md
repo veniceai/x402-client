@@ -19,6 +19,9 @@ const response = await venice.chat({
   model: 'llama-3.3-70b',
   messages: [{ role: 'user', content: 'Hello!' }]
 })
+
+console.log(response.choices[0].message.content)
+console.log(`Balance: $${venice.balance}`)
 ```
 
 ## Payment
@@ -34,4 +37,3 @@ const response = await venice.chat({
 ## License
 
 MIT
-
