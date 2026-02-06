@@ -16,7 +16,7 @@ import { VeniceClient } from '@venice-ai/x402-client'
 const venice = new VeniceClient(process.env.WALLET_KEY)
 
 const response = await venice.chat({
-  model: 'llama-3.3-70b',
+  model: 'kimi-k2-5',
   messages: [{ role: 'user', content: 'Hello!' }]
 })
 ```
