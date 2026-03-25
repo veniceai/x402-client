@@ -6,10 +6,13 @@ import { SiweMessage } from 'siwe'
 // =============================================================================
 
 const DEFAULT_API_URL = 'https://api.venice.ai'
+const SIWX_DOMAIN = 'outerface.venice.ai'
 const BASE_CHAIN_ID = 8453
 const USDC_DECIMALS = 6
 const USDC_ADDRESS = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
 const SIGN_IN_EXPIRY_MS = 10 * 60 * 1000 // 10 minutes
+const MAX_RETRIES = 3
+const RETRY_DELAY_MS = 1000
 
 // =============================================================================
 // Types
@@ -171,7 +174,9 @@ export class VeniceSigner {
     } catch {
       throw new VeniceError('INVALID_PRIVATE_KEY', 'Invalid private key format')
     }
-    this.domain = new URL(apiUrl).host
+    // Use outerface.venice.ai for production, localhost for local dev
+    const host = new URL(apiUrl).host
+    this.domain = host.includes('localhost') ? host : SIWX_DOMAIN
   }
 
   /** Wallet address (checksummed) */
@@ -319,9 +324,9 @@ export class VeniceClient {
 
   /**
    * Make an authenticated request to the API.
-   * Handles 402 responses with optional auto top-up.
+   * Handles 402 responses with optional auto top-up and retries on 429.
    */
-  async request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  async request<T>(path: string, options: RequestInit = {}, retryCount = 0): Promise<T> {
     const url = `${this.apiUrl}${path}`
     const response = await this.fetch(url, {
       ...options,
@@ -330,6 +335,13 @@ export class VeniceClient {
         ...options.headers,
       },
     })
+
+    // Handle rate limiting with retry
+    if (response.status === 429 && retryCount < MAX_RETRIES) {
+      const delay = RETRY_DELAY_MS * Math.pow(2, retryCount)
+      await new Promise(resolve => setTimeout(resolve, delay))
+      return this.request(path, options, retryCount + 1)
+    }
 
     if (response.status === 402) {
       if (this.autoTopUp?.enabled) {
@@ -348,6 +360,7 @@ export class VeniceClient {
       const data = await this.safeJson(response)
       throw new VeniceError('API_ERROR', data?.error || `Request failed with status ${response.status}`, {
         status: response.status,
+        code: data?.code,
       })
     }
 
@@ -362,10 +375,73 @@ export class VeniceClient {
 
   /** Create a chat completion */
   async chat(params: ChatParams): Promise<ChatResponse> {
+    if (params.stream) {
+      throw new VeniceError('INVALID_PARAMS', 'Use chatStream() for streaming responses')
+    }
     return this.request('/api/v1/chat/completions', {
       method: 'POST',
       body: JSON.stringify(params),
     })
+  }
+
+  /**
+   * Create a streaming chat completion.
+   * Returns an async iterator of delta content.
+   *
+   * @example
+   * ```typescript
+   * for await (const chunk of venice.chatStream({ model: 'llama-3.3-70b', messages })) {
+   *   process.stdout.write(chunk)
+   * }
+   * ```
+   */
+  async *chatStream(params: Omit<ChatParams, 'stream'>): AsyncGenerator<string, void, unknown> {
+    const response = await this.fetch(`${this.apiUrl}/api/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...params, stream: true }),
+    })
+
+    if (!response.ok) {
+      const data = await this.safeJson(response)
+      throw new VeniceError('API_ERROR', data?.error || `Request failed with status ${response.status}`, {
+        status: response.status,
+      })
+    }
+
+    const reader = response.body?.getReader()
+    if (!reader) {
+      throw new VeniceError('STREAM_ERROR', 'No response body')
+    }
+
+    const decoder = new TextDecoder()
+    let buffer = ''
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() || ''
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ') || line.includes('[DONE]')) continue
+          try {
+            const json = JSON.parse(line.slice(6))
+            const content = json.choices?.[0]?.delta?.content
+            if (content) yield content
+          } catch {
+            // Ignore parse errors
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock()
+    }
+
+    this.updateBalance(response)
   }
 
   /** Create embeddings for text */
@@ -379,11 +455,12 @@ export class VeniceClient {
   /** Fetch current balance from the server */
   async getBalance(): Promise<{
     balanceUsd: number
+    diemBalanceUsd: number
     canConsume: boolean
     minimumTopUpUsd: number
     suggestedTopUpUsd: number
   }> {
-    const response = await fetch(`${this.apiUrl}/api/v1/x402/balance/${this.address}`)
+    const response = await this.fetch(`${this.apiUrl}/api/v1/x402/balance/${this.address}`)
     if (!response.ok) {
       throw new VeniceError('BALANCE_ERROR', 'Failed to fetch balance')
     }
@@ -402,7 +479,7 @@ export class VeniceClient {
     const reqResponse = await fetch(`${this.apiUrl}/api/v1/x402/top-up`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ amount: amountUsd }),
+      body: JSON.stringify({ walletAddress: this.address, amountUsd }),
     })
 
     if (reqResponse.status !== 402) {
@@ -425,7 +502,7 @@ export class VeniceClient {
         'Content-Type': 'application/json',
         'X-402-Payment': paymentHeader,
       },
-      body: JSON.stringify({ amount: amountUsd }),
+      body: JSON.stringify({ walletAddress: this.address, amountUsd }),
     })
 
     if (!payResponse.ok) {
@@ -447,7 +524,7 @@ export class VeniceClient {
     }
   }
 
-  private async safeJson(response: Response): Promise<{ error?: string; currentBalanceUsd?: number; suggestedTopUpUsd?: number } | null> {
+  private async safeJson(response: Response): Promise<{ error?: string; code?: string; currentBalanceUsd?: number; suggestedTopUpUsd?: number } | null> {
     try {
       return await response.json()
     } catch {
