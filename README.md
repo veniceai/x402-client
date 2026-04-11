@@ -15,11 +15,18 @@ import { VeniceClient } from '@venice-ai/x402-client'
 
 const venice = new VeniceClient(process.env.WALLET_KEY)
 
+// New wallets usually need a top-up first unless the wallet already has
+// spendable DIEM-backed balance linked to a Venice account.
+await venice.topUp(10)
+
 const response = await venice.chat({
   model: 'kimi-k2-5',
   messages: [{ role: 'user', content: 'Hello!' }]
 })
 ```
+
+The client generates a fresh `X-Sign-In-With-X` header for each request and
+automatically updates the local balance from `X-Balance-Remaining` responses.
 
 ## With OpenAI-Compatible Tools
 
@@ -34,6 +41,10 @@ const authFetch = createAuthFetch(process.env.WALLET_KEY)
 
 - **USDC** - Pay per request on Base
 - **DIEM** - Stake for daily credits (1 DIEM = $1/day forever)
+
+Venice spends linked DIEM-backed balance first when it exists. If the wallet
+does not have spendable balance, top up with USDC on Base via
+`POST /api/v1/x402/top-up`.
 
 ## Links
 

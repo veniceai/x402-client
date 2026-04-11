@@ -6,13 +6,14 @@ import { SiweMessage } from 'siwe'
 // =============================================================================
 
 const DEFAULT_API_URL = 'https://api.venice.ai'
-const SIWX_DOMAIN = 'outerface.venice.ai'
 const BASE_CHAIN_ID = 8453
 const USDC_DECIMALS = 6
 const USDC_ADDRESS = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
-const SIGN_IN_EXPIRY_MS = 10 * 60 * 1000 // 10 minutes
+const PAYMENT_REQUIRED_HEADER = 'PAYMENT-REQUIRED'
+const SIGN_IN_EXPIRY_MS = 5 * 60 * 1000 // Venice treats SIWX payloads as short-lived
 const MAX_RETRIES = 3
 const RETRY_DELAY_MS = 1000
+const DEFAULT_TIMEOUT_MS = 60_000
 
 // =============================================================================
 // Types
@@ -27,6 +28,38 @@ export interface VeniceClientOptions {
     /** Amount in USD to top up */
     amount: number
   }
+  /** Request timeout in ms (default: 60000). Set 0 to disable. */
+  timeoutMs?: number
+}
+
+interface TopUpAccept {
+  protocol?: string
+  version?: number
+  network: string
+  asset: string
+  amount: string
+  payTo: string
+}
+
+interface TopUpRequirementsResponse {
+  x402Version: number
+  accepts: TopUpAccept[]
+}
+
+type SdkPaymentNetwork = 'base' | 'base-sepolia'
+
+interface SdkPaymentRequirements {
+  scheme: 'exact'
+  network: SdkPaymentNetwork
+  maxAmountRequired: string
+  resource: string
+  description: string
+  mimeType: string
+  payTo: string
+  maxTimeoutSeconds: number
+  asset: string
+  extra?: Record<string, unknown>
+  outputSchema?: Record<string, unknown>
 }
 
 export interface ChatMessage {
@@ -164,6 +197,7 @@ export interface VideoRetrieveResponse {
 export class VeniceSigner {
   private readonly wallet: Wallet
   private readonly domain: string
+  private readonly apiOrigin: string
 
   constructor(privateKey: string, apiUrl: string = DEFAULT_API_URL) {
     if (!privateKey || !privateKey.startsWith('0x')) {
@@ -174,9 +208,9 @@ export class VeniceSigner {
     } catch {
       throw new VeniceError('INVALID_PRIVATE_KEY', 'Invalid private key format')
     }
-    // Use outerface.venice.ai for production, localhost for local dev
-    const host = new URL(apiUrl).host
-    this.domain = host.includes('localhost') ? host : SIWX_DOMAIN
+    const url = new URL(apiUrl)
+    this.apiOrigin = url.origin
+    this.domain = url.host
   }
 
   /** Wallet address (checksummed) */
@@ -184,15 +218,21 @@ export class VeniceSigner {
     return this.wallet.address
   }
 
-  /** Create X-Sign-In-With-X header for authentication */
-  async signIn(): Promise<string> {
+  /** API origin used to resolve relative request URLs. */
+  get origin(): string {
+    return this.apiOrigin
+  }
+
+  /** Create a fresh X-Sign-In-With-X header for a specific resource. */
+  async signIn(resourceUrl?: string): Promise<string> {
     const now = new Date()
+    const requestUrl = resourceUrl ? new URL(resourceUrl, this.apiOrigin).toString() : this.apiOrigin
 
     const message = new SiweMessage({
       domain: this.domain,
       address: this.wallet.address,
-      statement: 'Sign in to Venice API',
-      uri: `https://${this.domain}`,
+      statement: 'Sign in to Venice AI',
+      uri: requestUrl,
       version: '1',
       chainId: BASE_CHAIN_ID,
       nonce: crypto.randomUUID().replace(/-/g, '').slice(0, 16),
@@ -203,38 +243,23 @@ export class VeniceSigner {
     const messageString = message.prepareMessage()
     const signature = await this.wallet.signMessage(messageString)
 
-    return Buffer.from(JSON.stringify({
+    const header = Buffer.from(JSON.stringify({
       address: this.wallet.address,
       message: messageString,
       signature,
       timestamp: now.getTime(),
       chainId: BASE_CHAIN_ID,
     })).toString('base64')
+    return header
   }
 
   /** Create X-402-Payment header for USDC payment */
-  async signPayment(requirements: {
-    asset: string
-    amount: string
-    payTo: string
-  }): Promise<string> {
+  async signPayment(requirements: SdkPaymentRequirements, x402Version: number): Promise<string> {
     const { createPaymentHeader } = await import('x402/client')
     const { createSigner } = await import('x402/types')
     const signer = await createSigner('base', this.wallet.privateKey as `0x${string}`)
 
-    return createPaymentHeader(signer, 1, {
-      scheme: 'exact',
-      network: 'base',
-      asset: requirements.asset,
-      maxAmountRequired: requirements.amount,
-      payTo: requirements.payTo,
-      maxTimeoutSeconds: 300,
-      extra: { name: 'USD Coin', version: '2' },
-      resource: '',
-      description: 'Venice x402 payment',
-      mimeType: 'application/json',
-      outputSchema: undefined,
-    })
+    return createPaymentHeader(signer, x402Version, requirements)
   }
 }
 
@@ -252,14 +277,17 @@ export class VeniceSigner {
  * ```
  */
 export function createAuthFetch(
-  privateKey: string,
+  signerOrKey: VeniceSigner | string,
   options: { apiUrl?: string } = {}
 ): typeof fetch {
-  const signer = new VeniceSigner(privateKey, options.apiUrl)
+  const signer = signerOrKey instanceof VeniceSigner
+    ? signerOrKey
+    : new VeniceSigner(signerOrKey, options.apiUrl)
 
   return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const headers = new Headers(init?.headers)
-    headers.set('X-Sign-In-With-X', await signer.signIn())
+    const requestUrl = resolveRequestUrl(input, signer.origin)
+    headers.set('X-Sign-In-With-X', await signer.signIn(requestUrl))
     return fetch(input, { ...init, headers })
   }
 }
@@ -300,13 +328,15 @@ export class VeniceClient {
   public readonly video: VideoAPI
 
   private readonly autoTopUp?: VeniceClientOptions['autoTopUp']
+  private readonly timeoutMs: number
   private _balance: number = 0
 
   constructor(privateKey: string, options: VeniceClientOptions = {}) {
     this.apiUrl = options.apiUrl || DEFAULT_API_URL
     this.autoTopUp = options.autoTopUp
+    this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
     this.signer = new VeniceSigner(privateKey, this.apiUrl)
-    this.fetch = createAuthFetch(privateKey, { apiUrl: this.apiUrl })
+    this.fetch = createAuthFetch(this.signer)
     this.images = new ImagesAPI(this)
     this.audio = new AudioAPI(this)
     this.video = new VideoAPI(this)
@@ -323,30 +353,42 @@ export class VeniceClient {
   }
 
   /**
-   * Make an authenticated request to the API.
-   * Handles 402 responses with optional auto top-up and retries on 429.
+   * Low-level authenticated request returning the raw Response.
+   * Handles 429 retries and 402 auto top-up.
    */
-  async request<T>(path: string, options: RequestInit = {}, retryCount = 0): Promise<T> {
+  async requestRaw(path: string, options: RequestInit = {}, retryCount = 0): Promise<Response> {
     const url = `${this.apiUrl}${path}`
-    const response = await this.fetch(url, {
-      ...options,
-      headers: {
-        'Content-Type': 'application/json',
-        ...options.headers,
-      },
-    })
 
-    // Handle rate limiting with retry
+    const controller = new AbortController()
+    const timeoutId = this.timeoutMs > 0
+      ? setTimeout(() => controller.abort(), this.timeoutMs)
+      : undefined
+
+    let response: Response
+    try {
+      response = await this.fetch(url, {
+        ...options,
+        signal: options.signal ?? controller.signal,
+      })
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError' && !options.signal) {
+        throw new VeniceError('TIMEOUT', `Request timed out after ${this.timeoutMs}ms`)
+      }
+      throw err
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId)
+    }
+
     if (response.status === 429 && retryCount < MAX_RETRIES) {
       const delay = RETRY_DELAY_MS * Math.pow(2, retryCount)
       await new Promise(resolve => setTimeout(resolve, delay))
-      return this.request(path, options, retryCount + 1)
+      return this.requestRaw(path, options, retryCount + 1)
     }
 
     if (response.status === 402) {
       if (this.autoTopUp?.enabled) {
         await this.topUp(this.autoTopUp.amount || 10)
-        return this.request(path, options)
+        return this.requestRaw(path, options)
       }
 
       const data = await this.safeJson(response)
@@ -365,6 +407,19 @@ export class VeniceClient {
     }
 
     this.updateBalance(response)
+    return response
+  }
+
+  /**
+   * Make an authenticated JSON request to the API.
+   * Sets Content-Type for requests with a body. Handles 429 retries and 402 auto top-up.
+   */
+  async request<T>(path: string, options: RequestInit = {}): Promise<T> {
+    const headers: Record<string, string> = {
+      ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+      ...(options.headers as Record<string, string>),
+    }
+    const response = await this.requestRaw(path, { ...options, headers })
     return response.json()
   }
 
@@ -387,6 +442,7 @@ export class VeniceClient {
   /**
    * Create a streaming chat completion.
    * Returns an async iterator of delta content.
+   * Handles 429 retries and 402 auto top-up on the initial request.
    *
    * @example
    * ```typescript
@@ -396,18 +452,11 @@ export class VeniceClient {
    * ```
    */
   async *chatStream(params: Omit<ChatParams, 'stream'>): AsyncGenerator<string, void, unknown> {
-    const response = await this.fetch(`${this.apiUrl}/api/v1/chat/completions`, {
+    const response = await this.requestRaw('/api/v1/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ...params, stream: true }),
     })
-
-    if (!response.ok) {
-      const data = await this.safeJson(response)
-      throw new VeniceError('API_ERROR', data?.error || `Request failed with status ${response.status}`, {
-        status: response.status,
-      })
-    }
 
     const reader = response.body?.getReader()
     if (!reader) {
@@ -433,15 +482,13 @@ export class VeniceClient {
             const content = json.choices?.[0]?.delta?.content
             if (content) yield content
           } catch {
-            // Ignore parse errors
+            // skip malformed SSE lines
           }
         }
       }
     } finally {
       reader.releaseLock()
     }
-
-    this.updateBalance(response)
   }
 
   /** Create embeddings for text */
@@ -460,10 +507,7 @@ export class VeniceClient {
     minimumTopUpUsd: number
     suggestedTopUpUsd: number
   }> {
-    const response = await this.fetch(`${this.apiUrl}/api/v1/x402/balance/${this.address}`)
-    if (!response.ok) {
-      throw new VeniceError('BALANCE_ERROR', 'Failed to fetch balance')
-    }
+    const response = await this.requestRaw(`/api/v1/x402/balance/${this.address}`)
     const data = await response.json()
     this._balance = data.data.balanceUsd
     return data.data
@@ -475,11 +519,9 @@ export class VeniceClient {
       throw new VeniceError('INVALID_AMOUNT', 'Top-up amount must be positive')
     }
 
-    // Step 1: Get payment requirements
+    // Step 1: Get payment requirements (no auth — expects 402 with x402 accepts)
     const reqResponse = await fetch(`${this.apiUrl}/api/v1/x402/top-up`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ walletAddress: this.address, amountUsd }),
     })
 
     if (reqResponse.status !== 402) {
@@ -487,22 +529,28 @@ export class VeniceClient {
       throw new VeniceError('TOP_UP_ERROR', data?.error || 'Failed to get payment requirements')
     }
 
-    const requirements = await reqResponse.json()
+    const requirements = await parseTopUpRequirements(reqResponse)
+    const paymentRequirement = selectTopUpRequirement(requirements.accepts)
+    const minimumAmountUsd = parseBaseUnitsToUsd(paymentRequirement.amount)
+
+    if (amountUsd < minimumAmountUsd) {
+      throw new VeniceError('INVALID_AMOUNT', `Top-up amount must be at least $${minimumAmountUsd.toFixed(2)}`, {
+        minimumAmount: minimumAmountUsd,
+        requestedAmount: amountUsd,
+      })
+    }
 
     // Step 2: Sign and submit payment
-    const paymentHeader = await this.signer.signPayment({
-      asset: requirements.paymentInfo?.tokenAddress || USDC_ADDRESS,
-      amount: String(Math.floor(amountUsd * Math.pow(10, USDC_DECIMALS))),
-      payTo: requirements.paymentInfo?.receiverWallet,
-    })
+    const paymentHeader = await this.signer.signPayment(
+      buildSdkPaymentRequirements(this.apiUrl, paymentRequirement, amountUsd),
+      requirements.x402Version,
+    )
 
     const payResponse = await fetch(`${this.apiUrl}/api/v1/x402/top-up`, {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json',
         'X-402-Payment': paymentHeader,
       },
-      body: JSON.stringify({ walletAddress: this.address, amountUsd }),
     })
 
     if (!payResponse.ok) {
@@ -560,23 +608,11 @@ class AudioAPI {
 
   /** Generate speech audio from text */
   async speech(params: SpeechParams): Promise<Blob> {
-    const response = await this.client.fetch(`${this.client.apiUrl}/api/v1/audio/speech`, {
+    const response = await this.client.requestRaw('/api/v1/audio/speech', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(params),
     })
-
-    if (!response.ok) {
-      let errorMessage = 'Speech generation failed'
-      try {
-        const data = await response.json()
-        errorMessage = data.error || errorMessage
-      } catch {
-        // Ignore JSON parse error
-      }
-      throw new VeniceError('API_ERROR', errorMessage)
-    }
-
     return response.blob()
   }
 
@@ -584,26 +620,14 @@ class AudioAPI {
   async transcribe(params: TranscribeParams): Promise<TranscribeResponse> {
     const formData = new FormData()
     formData.append('model', params.model)
-    formData.append('file', params.file as Blob)
+    formData.append('file', toBlob(params.file))
     if (params.language) formData.append('language', params.language)
     if (params.response_format) formData.append('response_format', params.response_format)
 
-    const response = await this.client.fetch(`${this.client.apiUrl}/api/v1/audio/asr`, {
+    const response = await this.client.requestRaw('/api/v1/audio/transcriptions', {
       method: 'POST',
       body: formData,
     })
-
-    if (!response.ok) {
-      let errorMessage = 'Transcription failed'
-      try {
-        const data = await response.json()
-        errorMessage = data.error || errorMessage
-      } catch {
-        // Ignore JSON parse error
-      }
-      throw new VeniceError('API_ERROR', errorMessage)
-    }
-
     return response.json()
   }
 }
@@ -687,4 +711,81 @@ export class VeniceError extends Error {
     super(message)
     this.name = 'VeniceError'
   }
+}
+
+function resolveRequestUrl(input: RequestInfo | URL, baseOrigin: string): string {
+  if (input instanceof URL) return input.toString()
+  if (typeof input === 'string') return new URL(input, baseOrigin).toString()
+  return new URL(input.url, baseOrigin).toString()
+}
+
+function normalizePaymentNetwork(network: string): SdkPaymentNetwork {
+  const normalized = network.trim().toLowerCase()
+  if (normalized === 'base-sepolia' || normalized === 'eip155:84532') return 'base-sepolia'
+  return 'base'
+}
+
+function parseBaseUnitsToUsd(amountBaseUnits: string): number {
+  const parsed = parseFloat(amountBaseUnits)
+  return Number.isNaN(parsed) ? 0 : parsed / Math.pow(10, USDC_DECIMALS)
+}
+
+function buildSdkPaymentRequirements(apiUrl: string, requirement: TopUpAccept, amountUsd: number): SdkPaymentRequirements {
+  return {
+    scheme: 'exact',
+    network: normalizePaymentNetwork(requirement.network),
+    maxAmountRequired: String(Math.round(amountUsd * Math.pow(10, USDC_DECIMALS))),
+    resource: `${apiUrl}/api/v1/x402/top-up`,
+    description: 'Venice x402 top-up',
+    mimeType: 'application/json',
+    payTo: requirement.payTo,
+    maxTimeoutSeconds: 300,
+    asset: requirement.asset || USDC_ADDRESS,
+    extra: { name: 'USD Coin', version: '2' },
+  }
+}
+
+function selectTopUpRequirement(accepts: TopUpAccept[]): TopUpAccept {
+  const exactBaseUsdc = accepts.find(
+    requirement => normalizePaymentNetwork(requirement.network) === 'base' && requirement.asset.toLowerCase() === USDC_ADDRESS.toLowerCase(),
+  )
+  return exactBaseUsdc ?? accepts[0]
+}
+
+async function parseTopUpRequirements(response: Response): Promise<TopUpRequirementsResponse> {
+  const body = await safeJson(response)
+  if (isTopUpRequirementsResponse(body)) return body
+
+  const encodedHeader = response.headers.get(PAYMENT_REQUIRED_HEADER)
+  if (!encodedHeader) {
+    throw new VeniceError('TOP_UP_ERROR', 'Missing payment requirements in 402 response')
+  }
+
+  try {
+    const decoded = Buffer.from(encodedHeader, 'base64').toString('utf8')
+    const parsed = JSON.parse(decoded)
+    if (isTopUpRequirementsResponse(parsed)) return parsed
+  } catch {
+    // Fall through to the generic error below.
+  }
+
+  throw new VeniceError('TOP_UP_ERROR', 'Invalid payment requirements returned by Venice')
+}
+
+function isTopUpRequirementsResponse(value: unknown): value is TopUpRequirementsResponse {
+  if (!value || typeof value !== 'object') return false
+  const maybe = value as Partial<TopUpRequirementsResponse>
+  return typeof maybe.x402Version === 'number' && Array.isArray(maybe.accepts) && maybe.accepts.length > 0
+}
+
+async function safeJson(response: Response): Promise<Record<string, unknown> | null> {
+  try {
+    return await response.clone().json()
+  } catch {
+    return null
+  }
+}
+
+function toBlob(file: Blob | Buffer): Blob {
+  return file instanceof Blob ? file : new Blob([new Uint8Array(file)])
 }
