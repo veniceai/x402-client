@@ -5,13 +5,13 @@ AI inference with your crypto wallet. No API keys.
 ## Install
 
 ```bash
-npm install @venice-ai/x402-client
+npm install @veniceai/x402-client
 ```
 
 ## Usage
 
 ```typescript
-import { VeniceClient } from '@venice-ai/x402-client'
+import { VeniceClient } from '@veniceai/x402-client'
 
 const venice = new VeniceClient(process.env.WALLET_KEY)
 
@@ -62,7 +62,7 @@ For anything else, you can still use `request()`, `requestRaw()`, or
 ## With OpenAI-Compatible Tools
 
 ```typescript
-import { createAuthFetch } from '@venice-ai/x402-client'
+import { createAuthFetch } from '@veniceai/x402-client'
 
 // Use with any tool that accepts a custom fetch
 const authFetch = createAuthFetch(process.env.WALLET_KEY)
