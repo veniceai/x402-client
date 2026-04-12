@@ -750,6 +750,7 @@ class ResponsesAPI {
 
     const decoder = new TextDecoder()
     let buffer = ''
+    let currentEvent: string | null = null
 
     try {
       while (true) {
@@ -761,9 +762,27 @@ class ResponsesAPI {
         buffer = lines.pop() || ''
 
         for (const line of lines) {
-          if (!line.startsWith('data: ') || line.includes('[DONE]')) continue
+          const trimmed = line.trim()
+          if (trimmed.length === 0) {
+            currentEvent = null
+            continue
+          }
+
+          if (trimmed.startsWith('event: ')) {
+            currentEvent = trimmed.slice(7).trim()
+            continue
+          }
+
+          if (!trimmed.startsWith('data: ') || trimmed.includes('[DONE]')) continue
           try {
-            const json = JSON.parse(line.slice(6)) as Record<string, unknown>
+            const json = JSON.parse(trimmed.slice(6)) as Record<string, unknown>
+
+            if (currentEvent === 'response.output_text.delta' && typeof json.delta === 'string') {
+              yield json.delta
+              continue
+            }
+
+            // Fallback for any future payloads that include a materialized output array.
             const output = Array.isArray(json.output) ? json.output : []
             for (const item of output) {
               if (isRecord(item) && item.type === 'message' && Array.isArray(item.content)) {
