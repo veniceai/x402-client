@@ -1,5 +1,5 @@
 {
-  "name": "@veniceai/x402-client",
+  "name": "venice-x402-client",
   "version": "0.2.0",
   "description": "AI inference with your crypto wallet. No API keys.",
   "main": "dist/index.js",
