@@ -1,6 +1,6 @@
 {
-  "name": "@venice-ai/x402-client",
-  "version": "0.1.0",
+  "name": "venice-x402-client",
+  "version": "0.2.0",
   "description": "AI inference with your crypto wallet. No API keys.",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
@@ -30,7 +30,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/venice-ai/x402-client.git"
+    "url": "https://github.com/veniceai/x402-client.git"
   },
   "homepage": "https://venice.ai",
   "dependencies": {
