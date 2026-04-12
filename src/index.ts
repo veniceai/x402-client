@@ -13,7 +13,7 @@ const PAYMENT_REQUIRED_HEADER = 'PAYMENT-REQUIRED'
 const SIGN_IN_EXPIRY_MS = 5 * 60 * 1000 // Venice treats SIWX payloads as short-lived
 const MAX_RETRIES = 3
 const RETRY_DELAY_MS = 1000
-const DEFAULT_TIMEOUT_MS = 60_000
+const DEFAULT_TIMEOUT_MS = 180_000
 
 // =============================================================================
 // Types
@@ -28,7 +28,7 @@ export interface VeniceClientOptions {
     /** Amount in USD to top up */
     amount: number
   }
-  /** Request timeout in ms (default: 60000). Set 0 to disable. */
+  /** Request timeout in ms (default: 180000). Set 0 to disable. */
   timeoutMs?: number
 }
 
@@ -89,6 +89,14 @@ export interface ChatResponse {
   }
 }
 
+export interface ResponsesParams extends Record<string, unknown> {
+  model: string
+  input?: unknown
+  stream?: boolean
+}
+
+export interface ResponsesResponse extends Record<string, unknown> {}
+
 export interface Model {
   id: string
   object: string
@@ -137,6 +145,10 @@ export interface ImageResponse {
   }>
 }
 
+export type OpenAiImageGenerateParams = Record<string, unknown>
+export type ImageMutationParams = object | FormData
+export type ImageMutationResponse = Blob | Record<string, unknown>
+
 export interface SpeechParams {
   model: string
   input: string
@@ -148,6 +160,8 @@ export interface SpeechParams {
 export interface TranscribeParams {
   model: string
   file: Blob | Buffer
+  filename?: string
+  mimeType?: string
   language?: string
   response_format?: 'json' | 'text' | 'srt' | 'vtt'
 }
@@ -155,6 +169,8 @@ export interface TranscribeParams {
 export interface TranscribeResponse {
   text: string
 }
+
+export type TranscribeResult = TranscribeResponse | string
 
 // Video types
 export interface VideoQueueParams {
@@ -173,6 +189,7 @@ export interface VideoQueueParams {
 export interface VideoQueueResponse {
   queue_id: string
   model: string
+  status?: string
 }
 
 export interface VideoRetrieveParams {
@@ -184,6 +201,52 @@ export interface VideoRetrieveResponse {
   status: 'pending' | 'processing' | 'completed' | 'failed'
   video_url?: string
   error?: string
+}
+
+export interface QueueResponse {
+  model: string
+  queue_id: string
+  status?: string
+}
+
+export interface CompletionResponse {
+  success: boolean
+}
+
+export interface MediaRetrieveStatusResponse extends Record<string, unknown> {
+  status: string
+  average_execution_time?: number
+  execution_duration?: number
+  error?: string
+}
+
+export type MediaRetrieveResponse = MediaRetrieveStatusResponse | Blob
+export type AudioQueueParams = Record<string, unknown>
+export type AudioRetrieveParams = Record<string, unknown>
+export type AudioCompleteParams = Record<string, unknown>
+export type VideoCompleteParams = Record<string, unknown>
+export type VideoTranscriptionParams = Record<string, unknown>
+export type VideoTranscriptionResponse = Record<string, unknown> | string
+
+export interface X402Transaction {
+  id: string
+  amount: number
+  balanceAfter: number
+  type: string
+  createdAt: string
+  requestId: string | null
+  modelId: string | null
+}
+
+export interface X402TransactionsResponse {
+  walletAddress: string
+  currentBalance: number
+  transactions: X402Transaction[]
+  pagination: {
+    limit: number
+    offset: number
+    hasMore: boolean
+  }
 }
 
 // =============================================================================
@@ -321,6 +384,9 @@ export class VeniceClient {
   /** Image generation API */
   public readonly images: ImagesAPI
 
+  /** Responses API */
+  public readonly responses: ResponsesAPI
+
   /** Audio API (speech & transcription) */
   public readonly audio: AudioAPI
 
@@ -338,6 +404,7 @@ export class VeniceClient {
     this.signer = new VeniceSigner(privateKey, this.apiUrl)
     this.fetch = createAuthFetch(this.signer)
     this.images = new ImagesAPI(this)
+    this.responses = new ResponsesAPI(this)
     this.audio = new AudioAPI(this)
     this.video = new VideoAPI(this)
   }
@@ -513,6 +580,17 @@ export class VeniceClient {
     return data.data
   }
 
+  /** Fetch x402 transaction history for the current wallet */
+  async getTransactions(options: { limit?: number; offset?: number } = {}): Promise<X402TransactionsResponse> {
+    const query = new URLSearchParams()
+    if (options.limit !== undefined) query.set('limit', String(options.limit))
+    if (options.offset !== undefined) query.set('offset', String(options.offset))
+    const suffix = query.size > 0 ? `?${query.toString()}` : ''
+    const response = await this.requestRaw(`/api/v1/x402/transactions/${this.address}${suffix}`)
+    const data = await response.json()
+    return data.data
+  }
+
   /** Top up balance with USDC on Base */
   async topUp(amountUsd: number): Promise<void> {
     if (amountUsd <= 0) {
@@ -590,11 +668,120 @@ class ImagesAPI {
   constructor(private readonly client: VeniceClient) {}
 
   /** Generate images from a text prompt */
-  async generate(params: ImageGenerateParams): Promise<ImageResponse> {
-    return this.client.request('/api/v1/image/generate', {
+  async generate(params: ImageGenerateParams): Promise<ImageResponse | Blob> {
+    return requestJsonOrBlob<ImageResponse>(this.client, '/api/v1/image/generate', {
+      method: 'POST',
+      ...buildBodyInit(params),
+    })
+  }
+
+  /** OpenAI-compatible image generations route */
+  async generations(params: OpenAiImageGenerateParams): Promise<ImageResponse> {
+    return this.client.request('/api/v1/images/generations', {
       method: 'POST',
       body: JSON.stringify(params),
     })
+  }
+
+  /** Upscale or enhance an image */
+  async upscale(params: ImageMutationParams): Promise<ImageMutationResponse> {
+    return requestJsonOrBlob<Record<string, unknown>>(this.client, '/api/v1/image/upscale', {
+      method: 'POST',
+      ...buildBodyInit(params),
+    })
+  }
+
+  /** Edit an image */
+  async edit(params: ImageMutationParams): Promise<ImageMutationResponse> {
+    return requestJsonOrBlob<Record<string, unknown>>(this.client, '/api/v1/image/edit', {
+      method: 'POST',
+      ...buildBodyInit(params),
+    })
+  }
+
+  /** Multi-edit an image */
+  async multiEdit(params: ImageMutationParams): Promise<ImageMutationResponse> {
+    return requestJsonOrBlob<Record<string, unknown>>(this.client, '/api/v1/image/multi-edit', {
+      method: 'POST',
+      ...buildBodyInit(params),
+    })
+  }
+
+  /** Remove image background */
+  async backgroundRemove(params: ImageMutationParams): Promise<ImageMutationResponse> {
+    return requestJsonOrBlob<Record<string, unknown>>(this.client, '/api/v1/image/background-remove', {
+      method: 'POST',
+      ...buildBodyInit(params),
+    })
+  }
+}
+
+// =============================================================================
+// ResponsesAPI
+// =============================================================================
+
+class ResponsesAPI {
+  constructor(private readonly client: VeniceClient) {}
+
+  /** Create a Responses API response */
+  async create(params: ResponsesParams): Promise<ResponsesResponse> {
+    if (params.stream) {
+      throw new VeniceError('INVALID_PARAMS', 'Use responses.stream() for streaming responses')
+    }
+
+    return this.client.request('/api/v1/responses', {
+      method: 'POST',
+      body: JSON.stringify(params),
+    })
+  }
+
+  /** Stream a Responses API response */
+  async *stream(params: Omit<ResponsesParams, 'stream'>): AsyncGenerator<string, void, unknown> {
+    const response = await this.client.requestRaw('/api/v1/responses', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...params, stream: true }),
+    })
+
+    const reader = response.body?.getReader()
+    if (!reader) {
+      throw new VeniceError('STREAM_ERROR', 'No response body')
+    }
+
+    const decoder = new TextDecoder()
+    let buffer = ''
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() || ''
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ') || line.includes('[DONE]')) continue
+          try {
+            const json = JSON.parse(line.slice(6)) as Record<string, unknown>
+            const output = Array.isArray(json.output) ? json.output : []
+            for (const item of output) {
+              if (isRecord(item) && item.type === 'message' && Array.isArray(item.content)) {
+                for (const content of item.content) {
+                  if (isRecord(content) && typeof content.text === 'string') {
+                    yield content.text
+                  }
+                }
+              }
+            }
+          } catch {
+            // skip malformed SSE lines
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock()
+    }
   }
 }
 
@@ -617,10 +804,10 @@ class AudioAPI {
   }
 
   /** Transcribe audio to text */
-  async transcribe(params: TranscribeParams): Promise<TranscribeResponse> {
+  async transcribe(params: TranscribeParams): Promise<TranscribeResult> {
     const formData = new FormData()
     formData.append('model', params.model)
-    formData.append('file', toBlob(params.file))
+    formData.append('file', toBlob(params.file, params.mimeType), params.filename ?? inferFilename(params.mimeType))
     if (params.language) formData.append('language', params.language)
     if (params.response_format) formData.append('response_format', params.response_format)
 
@@ -628,7 +815,32 @@ class AudioAPI {
       method: 'POST',
       body: formData,
     })
-    return response.json()
+    return parseResponseByContentType<TranscribeResponse>(response) as Promise<TranscribeResult>
+  }
+
+  /** Queue a new audio generation request */
+  async queue(params: AudioQueueParams): Promise<QueueResponse> {
+    return this.client.request('/api/v1/audio/queue', {
+      method: 'POST',
+      body: JSON.stringify(params),
+    })
+  }
+
+  /** Retrieve audio generation status or the completed audio */
+  async retrieve(params: AudioRetrieveParams): Promise<MediaRetrieveResponse> {
+    return requestJsonOrBlob<MediaRetrieveStatusResponse>(this.client, '/api/v1/audio/retrieve', {
+      method: 'POST',
+      body: JSON.stringify(params),
+      headers: { 'Content-Type': 'application/json' },
+    }) as Promise<MediaRetrieveResponse>
+  }
+
+  /** Mark an audio generation request as complete and clean up media */
+  async complete(params: AudioCompleteParams): Promise<CompletionResponse> {
+    return this.client.request('/api/v1/audio/complete', {
+      method: 'POST',
+      body: JSON.stringify(params),
+    })
   }
 }
 
@@ -655,11 +867,12 @@ class VideoAPI {
    * Retrieve video generation status/result.
    * Poll this endpoint until status is 'completed' or 'failed'.
    */
-  async retrieve(params: VideoRetrieveParams): Promise<VideoRetrieveResponse> {
-    return this.client.request('/api/v1/video/retrieve', {
+  async retrieve(params: VideoRetrieveParams): Promise<MediaRetrieveResponse> {
+    return requestJsonOrBlob<MediaRetrieveStatusResponse>(this.client, '/api/v1/video/retrieve', {
       method: 'POST',
       body: JSON.stringify(params),
-    })
+      headers: { 'Content-Type': 'application/json' },
+    }) as Promise<MediaRetrieveResponse>
   }
 
   /**
@@ -674,7 +887,7 @@ class VideoAPI {
     params: VideoQueueParams,
     pollIntervalMs: number = 5000,
     timeoutMs: number = 300000
-  ): Promise<string> {
+  ): Promise<Blob> {
     const { queue_id } = await this.queue(params)
 
     const startTime = Date.now()
@@ -684,8 +897,8 @@ class VideoAPI {
 
       const result = await this.retrieve({ queue_id })
 
-      if (result.status === 'completed' && result.video_url) {
-        return result.video_url
+      if (result instanceof Blob) {
+        return result
       }
 
       if (result.status === 'failed') {
@@ -694,6 +907,23 @@ class VideoAPI {
     }
 
     throw new VeniceError('VIDEO_TIMEOUT', `Video generation timed out after ${timeoutMs}ms`)
+  }
+
+  /** Mark a video generation request as complete and clean up media */
+  async complete(params: VideoCompleteParams): Promise<CompletionResponse> {
+    return this.client.request('/api/v1/video/complete', {
+      method: 'POST',
+      body: JSON.stringify(params),
+    })
+  }
+
+  /** Transcribe video audio from a public URL */
+  async transcribe(params: VideoTranscriptionParams): Promise<VideoTranscriptionResponse> {
+    return requestJsonTextOrBlob<Record<string, unknown>>(this.client, '/api/v1/video/transcriptions', {
+      method: 'POST',
+      body: JSON.stringify(params),
+      headers: { 'Content-Type': 'application/json' },
+    }) as Promise<VideoTranscriptionResponse>
   }
 }
 
@@ -786,6 +1016,92 @@ async function safeJson(response: Response): Promise<Record<string, unknown> | n
   }
 }
 
-function toBlob(file: Blob | Buffer): Blob {
-  return file instanceof Blob ? file : new Blob([new Uint8Array(file)])
+function toBlob(file: Blob | Buffer, mimeType?: string): Blob {
+  if (file instanceof Blob) {
+    if (mimeType && file.type !== mimeType) {
+      return new Blob([file], { type: mimeType })
+    }
+    return file
+  }
+
+  return new Blob([new Uint8Array(file)], mimeType ? { type: mimeType } : undefined)
+}
+
+function inferFilename(mimeType?: string): string {
+  switch (mimeType) {
+    case 'audio/wav':
+    case 'audio/x-wav':
+      return 'audio.wav'
+    case 'audio/mpeg':
+      return 'audio.mp3'
+    case 'audio/flac':
+      return 'audio.flac'
+    case 'audio/aac':
+      return 'audio.aac'
+    case 'audio/ogg':
+      return 'audio.ogg'
+    case 'audio/webm':
+      return 'audio.webm'
+    case 'audio/mp4':
+      return 'audio.m4a'
+    default:
+      return 'audio.wav'
+  }
+}
+
+function buildBodyInit(body: object | FormData): Pick<RequestInit, 'body' | 'headers'> {
+  if (body instanceof FormData) {
+    return { body }
+  }
+
+  return {
+    body: JSON.stringify(body),
+    headers: { 'Content-Type': 'application/json' },
+  }
+}
+
+async function requestJsonTextOrBlob<T>(
+  client: VeniceClient,
+  path: string,
+  options: RequestInit,
+): Promise<T | string | Blob> {
+  const response = await client.requestRaw(path, options)
+  return parseResponseByContentType<T>(response)
+}
+
+async function requestJsonOrBlob<T>(
+  client: VeniceClient,
+  path: string,
+  options: RequestInit,
+): Promise<T | Blob> {
+  const response = await client.requestRaw(path, options)
+  return parseJsonOrBlob<T>(response)
+}
+
+async function parseResponseByContentType<T>(response: Response): Promise<T | string | Blob> {
+  const contentType = response.headers.get('content-type') || ''
+
+  if (contentType.includes('application/json')) {
+    return response.json()
+  }
+
+  if (contentType.startsWith('text/')) {
+    return response.text()
+  }
+
+  return response.blob()
+}
+
+async function parseJsonOrBlob<T>(response: Response): Promise<T | Blob> {
+  const contentType = response.headers.get('content-type') || ''
+
+  if (contentType.includes('application/json')) {
+    return response.json()
+  }
+
+  return response.blob()
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }

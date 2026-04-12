@@ -28,6 +28,37 @@ const response = await venice.chat({
 The client generates a fresh `X-Sign-In-With-X` header for each request and
 automatically updates the local balance from `X-Balance-Remaining` responses.
 
+## Supported helpers
+
+The client currently includes first-class helpers for:
+
+- `chat()` and `chatStream()`
+- `responses.create()` and `responses.stream()`
+- `models()`
+- `embeddings()`
+- `getBalance()`
+- `getTransactions()`
+- `topUp()`
+- `images.generate()`
+- `images.generations()`
+- `images.upscale()`
+- `images.edit()`
+- `images.multiEdit()`
+- `images.backgroundRemove()`
+- `audio.speech()`
+- `audio.transcribe()`
+- `audio.queue()`
+- `audio.retrieve()`
+- `audio.complete()`
+- `video.queue()`
+- `video.retrieve()`
+- `video.generate()`
+- `video.complete()`
+- `video.transcribe()`
+
+For anything else, you can still use `request()`, `requestRaw()`, or
+`createAuthFetch()` against Venice routes directly.
+
 ## With OpenAI-Compatible Tools
 
 ```typescript
