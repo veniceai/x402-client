@@ -7,9 +7,14 @@ import { SiweMessage } from 'siwe'
 
 const DEFAULT_API_URL = 'https://api.venice.ai'
 const BASE_CHAIN_ID = 8453
+const BASE_NETWORK = `eip155:${BASE_CHAIN_ID}`
 const USDC_DECIMALS = 6
 const USDC_ADDRESS = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
 const PAYMENT_REQUIRED_HEADER = 'PAYMENT-REQUIRED'
+const SIGN_IN_HEADER = 'SIGN-IN-WITH-X'
+const SIGN_IN_STATEMENT = 'Sign in to Venice AI'
+const SIGN_IN_TYPE = 'eip191'
+const SIGN_IN_NONCE_BYTES = 16 // 32 hex characters, as the sign-in-with-x spec generates them
 const SIGN_IN_EXPIRY_MS = 5 * 60 * 1000 // Venice treats SIWX payloads as short-lived
 const MAX_RETRIES = 3
 const RETRY_DELAY_MS = 1000
@@ -286,34 +291,35 @@ export class VeniceSigner {
     return this.apiOrigin
   }
 
-  /** Create a fresh X-Sign-In-With-X header for a specific resource. */
+  /**
+   * Create a fresh SIGN-IN-WITH-X header for a specific resource.
+   * The payload is the x402 sign-in-with-x proof: the signed EIP-4361 fields,
+   * a CAIP-2 chainId, the signature type and the signature.
+   */
   async signIn(resourceUrl?: string): Promise<string> {
     const now = new Date()
     const requestUrl = resourceUrl ? new URL(resourceUrl, this.apiOrigin).toString() : this.apiOrigin
 
-    const message = new SiweMessage({
+    const fields = {
       domain: this.domain,
       address: this.wallet.address,
-      statement: 'Sign in to Venice AI',
+      statement: SIGN_IN_STATEMENT,
       uri: requestUrl,
       version: '1',
-      chainId: BASE_CHAIN_ID,
-      nonce: crypto.randomUUID().replace(/-/g, '').slice(0, 16),
+      nonce: createNonce(),
       issuedAt: now.toISOString(),
       expirationTime: new Date(now.getTime() + SIGN_IN_EXPIRY_MS).toISOString(),
-    })
+    }
+    // The signed message carries the bare chain reference; the proof carries CAIP-2.
+    const message = new SiweMessage({ ...fields, chainId: BASE_CHAIN_ID }).prepareMessage()
+    const signature = await this.wallet.signMessage(message)
 
-    const messageString = message.prepareMessage()
-    const signature = await this.wallet.signMessage(messageString)
-
-    const header = Buffer.from(JSON.stringify({
-      address: this.wallet.address,
-      message: messageString,
+    return Buffer.from(JSON.stringify({
+      ...fields,
+      chainId: BASE_NETWORK,
+      type: SIGN_IN_TYPE,
       signature,
-      timestamp: now.getTime(),
-      chainId: BASE_CHAIN_ID,
     })).toString('base64')
-    return header
   }
 
   /** Create X-402-Payment header for USDC payment */
@@ -350,7 +356,7 @@ export function createAuthFetch(
   return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const headers = new Headers(init?.headers)
     const requestUrl = resolveRequestUrl(input, signer.origin)
-    headers.set('X-Sign-In-With-X', await signer.signIn(requestUrl))
+    headers.set(SIGN_IN_HEADER, await signer.signIn(requestUrl))
     return fetch(input, { ...init, headers })
   }
 }
@@ -960,6 +966,11 @@ export class VeniceError extends Error {
     super(message)
     this.name = 'VeniceError'
   }
+}
+
+function createNonce(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(SIGN_IN_NONCE_BYTES))
+  return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('')
 }
 
 function resolveRequestUrl(input: RequestInfo | URL, baseOrigin: string): string {
