@@ -7,6 +7,7 @@ import { SiweMessage } from 'siwe'
 
 const DEFAULT_API_URL = 'https://api.venice.ai'
 const BASE_CHAIN_ID = 8453
+const BASE_NETWORK = `eip155:${BASE_CHAIN_ID}`
 const USDC_DECIMALS = 6
 const USDC_ADDRESS = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
 const PAYMENT_REQUIRED_HEADER = 'PAYMENT-REQUIRED'
@@ -968,10 +969,12 @@ function resolveRequestUrl(input: RequestInfo | URL, baseOrigin: string): string
   return new URL(input.url, baseOrigin).toString()
 }
 
-function normalizePaymentNetwork(network: string): SdkPaymentNetwork {
+/** Map a CAIP-2 or x402 v1 network name to the SDK's name, or undefined for any other chain. */
+function normalizePaymentNetwork(network: string): SdkPaymentNetwork | undefined {
   const normalized = network.trim().toLowerCase()
+  if (normalized === 'base' || normalized === BASE_NETWORK) return 'base'
   if (normalized === 'base-sepolia' || normalized === 'eip155:84532') return 'base-sepolia'
-  return 'base'
+  return undefined
 }
 
 function parseBaseUnitsToUsd(amountBaseUnits: string): number {
@@ -979,10 +982,10 @@ function parseBaseUnitsToUsd(amountBaseUnits: string): number {
   return Number.isNaN(parsed) ? 0 : parsed / Math.pow(10, USDC_DECIMALS)
 }
 
-function buildSdkPaymentRequirements(apiUrl: string, requirement: TopUpAccept, amountUsd: number): SdkPaymentRequirements {
+function buildSdkPaymentRequirements(apiUrl: string, requirement: BaseTopUpAccept, amountUsd: number): SdkPaymentRequirements {
   return {
     scheme: 'exact',
-    network: normalizePaymentNetwork(requirement.network),
+    network: requirement.sdkNetwork,
     maxAmountRequired: String(Math.round(amountUsd * Math.pow(10, USDC_DECIMALS))),
     resource: `${apiUrl}/api/v1/x402/top-up`,
     description: 'Venice x402 top-up',
@@ -994,11 +997,19 @@ function buildSdkPaymentRequirements(apiUrl: string, requirement: TopUpAccept, a
   }
 }
 
-function selectTopUpRequirement(accepts: TopUpAccept[]): TopUpAccept {
-  const exactBaseUsdc = accepts.find(
-    requirement => normalizePaymentNetwork(requirement.network) === 'base' && requirement.asset.toLowerCase() === USDC_ADDRESS.toLowerCase(),
-  )
-  return exactBaseUsdc ?? accepts[0]
+interface BaseTopUpAccept extends TopUpAccept {
+  sdkNetwork: SdkPaymentNetwork
+}
+
+/** Pick the Base USDC entry. The signer only holds an EVM key, so other chains are never paid. */
+function selectTopUpRequirement(accepts: TopUpAccept[]): BaseTopUpAccept {
+  for (const requirement of accepts) {
+    const sdkNetwork = normalizePaymentNetwork(requirement.network)
+    if (sdkNetwork === 'base' && requirement.asset.toLowerCase() === USDC_ADDRESS.toLowerCase()) {
+      return { ...requirement, sdkNetwork }
+    }
+  }
+  throw new VeniceError('TOP_UP_ERROR', 'Venice offered no USDC top-up on Base')
 }
 
 async function parseTopUpRequirements(response: Response): Promise<TopUpRequirementsResponse> {
