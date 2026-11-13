@@ -4,7 +4,7 @@ Wallet-native access to the Venice API. No API keys.
 
 This SDK handles the two main pieces of the Venice x402 flow:
 
-- wallet authentication with a fresh `X-Sign-In-With-X` header on every request
+- wallet authentication with a fresh `SIGN-IN-WITH-X` header on every request
 - balance-backed payments, including `topUp()` with USDC on Base
 
 ## Install
@@ -45,7 +45,7 @@ console.log(response.choices[0]?.message?.content)
 
 With Venice, your wallet is the identity layer and your Venice balance is the spend layer.
 
-1. The SDK generates a fresh `X-Sign-In-With-X` header for each request.
+1. The SDK generates a fresh `SIGN-IN-WITH-X` header for each request: an x402 sign-in-with-x proof signed with your wallet on Base (`eip155:8453`, `eip191`).
 2. Venice checks whether the wallet has spendable balance.
 3. Paid endpoints spend from that balance.
 4. If the wallet does not have spendable balance yet, `topUp()` fetches Venice's x402 payment requirements, signs the Base USDC payment, and retries the top-up request.
